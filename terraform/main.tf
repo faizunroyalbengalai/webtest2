@@ -13,17 +13,25 @@ provider "aws" {
 }
 
 variable "public_key" {
-  type = string
-}
-
-variable "instance_type" {
-  type    = string
-  default = "t3.micro"
+  description = "SSH public key for EC2 access"
+  type        = string
 }
 
 variable "app_name" {
-  type    = string
-  default = "webtest2"
+  description = "Application name"
+  type        = string
+  default     = "webtest2"
+}
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
 }
 
 data "aws_ami" "ubuntu" {
@@ -41,19 +49,8 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-}
-
 resource "aws_key_pair" "deployer" {
-  key_name   = "${var.app_name}-key"
+  key_name   = "${var.app_name}-deployer-key"
   public_key = var.public_key
 
   lifecycle {
@@ -108,13 +105,17 @@ resource "aws_security_group" "app_sg" {
   lifecycle {
     create_before_destroy = true
   }
+
+  tags = {
+    Name = "${var.app_name}-sg"
+  }
 }
 
 resource "aws_instance" "app" {
   ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type
+  instance_type               = "t3.micro"
   key_name                    = aws_key_pair.deployer.key_name
-  subnet_id                   = data.aws_subnets.default.ids[0]
+  subnet_id                   = tolist(data.aws_subnets.default.ids)[0]
   vpc_security_group_ids      = [aws_security_group.app_sg.id]
   associate_public_ip_address = true
 
@@ -124,19 +125,29 @@ resource "aws_instance" "app" {
   }
 
   tags = {
-    Name    = var.app_name
-    Project = var.app_name
+    Name    = "${var.app_name}-instance"
+    App     = var.app_name
+    Region  = "us-east-1"
+    Runtime = "python3.11"
   }
 }
 
 output "instance_ip" {
-  value = aws_instance.app.public_ip
+  description = "Public IP of the EC2 instance"
+  value       = aws_instance.app.public_ip
 }
 
 output "instance_id" {
-  value = aws_instance.app.id
+  description = "EC2 instance ID"
+  value       = aws_instance.app.id
 }
 
-output "public_ip" {
-  value = aws_instance.app.public_ip
+output "ssh_command" {
+  description = "SSH command to connect to the instance"
+  value       = "ssh -i <private_key> ubuntu@${aws_instance.app.public_ip}"
+}
+
+output "app_url" {
+  description = "Application URL"
+  value       = "http://${aws_instance.app.public_ip}"
 }

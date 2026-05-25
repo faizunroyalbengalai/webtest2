@@ -17,10 +17,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
-          python-version: "3.11"
+          terraform_wrapper: false
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -29,16 +29,10 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_wrapper: false
-
       - name: Terraform Init
         working-directory: terraform
         run: |
-          terraform init \
-            -reconfigure \
+          terraform init -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="region=us-east-1" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
@@ -50,19 +44,16 @@ jobs:
             -var="public_key=${{ secrets.EC2_SSH_PUBLIC_KEY }}" \
             -var="region=us-east-1"
 
-      - name: Get server IP
+      - name: Get Server IP
         id: get_ip
         working-directory: terraform
         run: |
-          SERVER_IP=$(terraform output -raw instance_public_ip)
-          echo "server_ip=$SERVER_IP" >> "$GITHUB_OUTPUT"
+          echo "server_ip=$(terraform output -raw public_ip)" >> "$GITHUB_OUTPUT"
 
   configure:
     name: Configure EC2 with Ansible
     runs-on: ubuntu-latest
     needs: provision
-    env:
-      ANSIBLE_HOST_KEY_CHECKING: "False"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,20 +64,22 @@ jobs:
           python-version: "3.11"
 
       - name: Install Ansible
-        run: pip install ansible
+        run: |
+          pip install ansible
 
       - name: Write SSH private key
         run: |
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/deploy_key
-          chmod 600 /tmp/deploy_key
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
 
       - name: Wait for SSH to be ready
         run: |
           SERVER_IP="${{ needs.provision.outputs.server_ip }}"
           echo "Waiting for SSH on $SERVER_IP..."
           for i in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/deploy_key ubuntu@"$SERVER_IP" "echo ready" 2>/dev/null; then
-              echo "SSH is ready."
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/deploy_key ubuntu@$SERVER_IP "echo ready" 2>/dev/null; then
+              echo "SSH is ready"
               break
             fi
             echo "Attempt $i failed, retrying in 10s..."
@@ -94,72 +87,65 @@ jobs:
           done
 
       - name: Run Ansible Playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
           SERVER_IP="${{ needs.provision.outputs.server_ip }}"
-          ansible-playbook -i "$SERVER_IP," \
-            --private-key /tmp/deploy_key \
+          ansible-playbook ansible/playbook.yml \
+            -i "$SERVER_IP," \
             -u ubuntu \
-            ansible/playbook.yml \
+            --private-key ~/.ssh/deploy_key \
+            -e "app_repo=${{ secrets.APP_REPO }}" \
             -e "app_dir=/opt/app" \
-            -e "repo_url=${{ secrets.REPO_URL }}" \
-            -e "branch=${{ github.ref_name }}" \
+            -e "app_port=8000" \
+            -e "python_version=3.11" \
             -e "database_url='${{ secrets.DATABASE_URL }}'" \
             -e "mongo_uri='${{ secrets.MONGO_URI }}'" \
             -e "db_host='${{ secrets.DB_HOST }}'" \
             -e "db_port='${{ secrets.DB_PORT }}'" \
             -e "db_name='${{ secrets.DB_NAME }}'" \
             -e "db_user='${{ secrets.DB_USER }}'" \
-            -e "db_password='${{ secrets.DB_PASSWORD }}'" \
-            -e "install_db='${{ secrets.INSTALL_DB_ON_EC2 }}'" \
-            -e "db_type='${{ secrets.DB_TYPE }}'" \
+            -e "db_user='${{ secrets.DB_USER }}'" \
             -e "db_username='${{ secrets.DB_USERNAME }}'" \
-            -e "db_password_plain='${{ secrets.DB_PASSWORD }}'"
+            -e "db_password='${{ secrets.DB_PASSWORD }}'" \
+            -e "db_password_plain='${{ secrets.DB_PASSWORD }}'" \
+            -e "install_db='${{ secrets.INSTALL_DB_ON_EC2 }}'" \
+            -e "db_type='${{ secrets.DB_TYPE }}'"
 
   verify:
     name: Verify Deployment
     runs-on: ubuntu-latest
     needs: [provision, configure]
-    env:
-      ANSIBLE_HOST_KEY_CHECKING: "False"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Install Ansible
-        run: pip install ansible
+        run: |
+          pip install ansible
 
       - name: Write SSH private key
         run: |
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/deploy_key
-          chmod 600 /tmp/deploy_key
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
 
-      - name: Verify application health
+      - name: Verify application health via Ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
           SERVER_IP="${{ needs.provision.outputs.server_ip }}"
-          ansible -i "$SERVER_IP," all \
-            --private-key /tmp/deploy_key \
+          ansible-playbook ansible/verify.yml \
+            -i "$SERVER_IP," \
             -u ubuntu \
-            -m shell \
-            -a "
-              echo 'Waiting for app on 127.0.0.1:8000...'
-              for i in \$(seq 1 12); do
-                if curl -sf http://127.0.0.1:8000/health; then
-                  echo 'Health check passed.'
-                  echo 'server_ip=$SERVER_IP'
-                  exit 0
-                fi
-                echo \"Attempt \$i failed, retrying in 10s...\"
-                sleep 10
-              done
-              echo 'Health check timed out after 120s. Showing logs:'
-              sudo journalctl -u webtest2 --no-pager -n 50 || true
-              exit 1
-            "
-
-      - name: Print server IP on success
-        run: |
-          echo "Deployment verified successfully."
-          echo "server_ip=${{ needs.provision.outputs.server_ip }}"
+            --private-key ~/.ssh/deploy_key \
+            -e "app_port=8000" \
+            -e "server_ip=$SERVER_IP"
 
   notify:
     name: Notify Deployment Result
@@ -167,18 +153,15 @@ jobs:
     needs: [provision, verify]
     if: always()
     steps:
-      - name: Deployment success notification
+      - name: Deployment success
         if: ${{ needs.verify.result == 'success' }}
         run: |
           echo "Deployment of webtest2 succeeded!"
-          echo "Server IP: ${{ needs.provision.outputs.server_ip }}"
-          echo "App URL: http://${{ needs.provision.outputs.server_ip }}"
-          echo "Health URL: http://${{ needs.provision.outputs.server_ip }}/health"
+          echo "Application is available at: http://${{ needs.provision.outputs.server_ip }}"
 
-      - name: Deployment failure notification
+      - name: Deployment failed
         if: ${{ needs.verify.result != 'success' }}
         run: |
-          echo "Deployment of webtest2 FAILED."
-          echo "Server IP: ${{ needs.provision.outputs.server_ip }}"
-          echo "Check logs above for details."
+          echo "Deployment of webtest2 failed!"
+          echo "Please check the logs above for details."
           exit 1
